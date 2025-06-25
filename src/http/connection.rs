@@ -448,16 +448,10 @@ impl<K: Key, IO: AsyncReadRent + AsyncWriteRent> HttpConnection<K, IO> {
                 let (parts, body) = request.into_parts();
                 let http_body: HttpBody = body.into();
                 let h1_payload = match http_body {
-                    monoio_http::common::body::HttpBody::H1(payload) => payload,
-                    monoio_http::common::body::HttpBody::H2(_h2_body) => {
-                        // Convert H2 body to H1 payload - use None for simplicity
-                        monoio_http::h1::payload::Payload::None
-                    },
-                    monoio_http::common::body::HttpBody::Ready(_bytes_opt) => {
-                        // Convert Ready bytes to Fixed payload - for simplicity, use None
-                        // TODO: Properly convert bytes to fixed payload
-                        monoio_http::h1::payload::Payload::None
-                    },
+                    HttpBody::H1(payload) => payload,
+                    _ => {
+                        Payload::None
+                    }
                 };
                 let h1_request = monoio_http::common::request::Request::from_parts(parts, h1_payload);
                 conn.send_reconstructed_request(h1_request).await
