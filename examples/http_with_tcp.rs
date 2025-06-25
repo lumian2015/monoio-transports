@@ -58,7 +58,7 @@ async fn handle_request_h2(
     Ok(())
 }
 
-#[monoio::main]
+#[monoio::main(timer = true)]
 async fn main() -> Result<(), monoio_transports::TransportError> {
     #[derive(Debug, Clone, Eq, PartialEq, Hash)]
     struct Key {

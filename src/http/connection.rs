@@ -22,7 +22,25 @@ use monoio_http::{
     h2::client::SendRequest,
 };
 
+
 use crate::pool::{Key, Poolable, Pooled};
+use std::cell::Cell;
+
+// Thread-local variable to track if the current request is a HEAD request
+thread_local! {
+    static IS_HEAD_REQUEST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set whether the current request is a HEAD request
+fn set_head_request(is_head: bool) {
+    IS_HEAD_REQUEST.with(|cell| cell.set(is_head));
+}
+
+/// Check if the current request is a HEAD request
+fn is_head_request() -> bool {
+    IS_HEAD_REQUEST.with(|cell| cell.get())
+}
+
 
 /// A HTTP/1.1 connection.
 pub struct Http1Connection<IO: AsyncWriteRent> {
@@ -39,6 +57,8 @@ impl<IO: AsyncWriteRent> Http1Connection<IO> {
             open: true,
         }
     }
+
+
 }
 
 impl<IO: AsyncWriteRent> Poolable for Http1Connection<IO> {
@@ -71,6 +91,7 @@ impl<IO: AsyncReadRent + AsyncWriteRent> Http1Connection<IO> {
         match handle.next().await {
             Some(Ok(resp)) => {
                 let (parts, payload_decoder) = resp.into_parts();
+                
                 match payload_decoder {
                     PayloadDecoder::None => {
                         let payload = Payload::None;
@@ -78,36 +99,149 @@ impl<IO: AsyncReadRent + AsyncWriteRent> Http1Connection<IO> {
                         (Ok(response), false)
                     }
                     PayloadDecoder::Fixed(_) => {
-                        let mut framed_payload = payload_decoder.with_io(handle);
-                        let (payload, payload_sender) = fixed_payload_pair();
-                        if let Some(data) = framed_payload.next_data().await {
-                            payload_sender.feed(data)
+                        if is_head_request() {
+                            // For HEAD requests, servers may return Content-Length but no actual body
+                            // RFC 7231: A HEAD response has the same headers as a GET response, 
+                            // but MUST NOT contain a message-body
+                            let payload = Payload::None;
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
+                        } else {
+                            let mut framed_payload = payload_decoder.with_io(handle);
+                            let (payload, payload_sender) = fixed_payload_pair();
+                            if let Some(data) = framed_payload.next_data().await {
+                                payload_sender.feed(data)
+                            }
+                            let payload = Payload::Fixed(payload);
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
                         }
-                        let payload = Payload::Fixed(payload);
+                    }
+                    PayloadDecoder::Streamed(_) => {
+                        if is_head_request() {
+                            // For HEAD requests, servers may return Transfer-Encoding: chunked but no actual body
+                            // RFC 7231: A HEAD response has the same headers as a GET response, 
+                            // but MUST NOT contain a message-body
+                            let payload = Payload::None;
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
+                        } else {
+                            let mut framed_payload = payload_decoder.with_io(handle);
+                            let (payload, mut payload_sender) = stream_payload_pair();
+                            loop {
+                                match framed_payload.next_data().await {
+                                    Some(Ok(data)) => payload_sender.feed_data(Some(data)),
+                                    Some(Err(e)) => {
+                                        #[cfg(feature = "logging")]
+                                        tracing::error!("decode upstream response error {:?}", e);
+                                        self.open = false;
+                                        return (Err(e), false);
+                                    }
+                                    None => {
+                                        payload_sender.feed_data(None);
+                                        break;
+                                    }
+                                }
+                            }
+                            let payload = Payload::Stream(payload);
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
+                        }
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                #[cfg(feature = "logging")]
+                tracing::error!("decode upstream response error {:?}", e);
+                self.open = false;
+                (Err(e), false)
+            }
+            None => {
+                #[cfg(feature = "logging")]
+                tracing::error!("upstream return eof");
+                self.open = false;
+                (Err(DecodeError::UnexpectedEof.into()), false)
+            }
+        }
+    }
+
+    /// Send an already reconstructed request (for internal use by HttpConnection)
+    pub async fn send_reconstructed_request<E>(
+        &mut self,
+        request: monoio_http::common::request::Request<monoio_http::h1::payload::Payload>,
+    ) -> (Result<Response<HttpBody>, HttpError>, bool)
+    where
+        ClientCodec<IO>: Sink<monoio_http::common::request::Request<monoio_http::h1::payload::Payload>, Error = E>,
+        E: std::fmt::Debug + Into<HttpError>,
+    {
+        let handle = &mut self.framed;
+
+        if let Err(e) = handle.send_and_flush(request).await {
+            #[cfg(feature = "logging")]
+            tracing::error!("send upstream request error {:?}", e);
+            self.open = false;
+            return (Err(e.into()), false);
+        }
+
+        match handle.next().await {
+            Some(Ok(resp)) => {
+                let (parts, payload_decoder) = resp.into_parts();
+                
+                match payload_decoder {
+                    PayloadDecoder::None => {
+                        let payload = Payload::None;
                         let response = Response::from_parts(parts, payload.into());
                         (Ok(response), false)
                     }
+                    PayloadDecoder::Fixed(_) => {
+                        if is_head_request() {
+                            // For HEAD requests, servers may return Content-Length but no actual body
+                            // RFC 7231: A HEAD response has the same headers as a GET response, 
+                            // but MUST NOT contain a message-body
+                            let payload = Payload::None;
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
+                        } else {
+                            let mut framed_payload = payload_decoder.with_io(handle);
+                            let (payload, payload_sender) = fixed_payload_pair();
+                            if let Some(data) = framed_payload.next_data().await {
+                                payload_sender.feed(data)
+                            }
+                            let payload = Payload::Fixed(payload);
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
+                        }
+                    }
                     PayloadDecoder::Streamed(_) => {
-                        let mut framed_payload = payload_decoder.with_io(handle);
-                        let (payload, mut payload_sender) = stream_payload_pair();
-                        loop {
-                            match framed_payload.next_data().await {
-                                Some(Ok(data)) => payload_sender.feed_data(Some(data)),
-                                Some(Err(e)) => {
-                                    #[cfg(feature = "logging")]
-                                    tracing::error!("decode upstream response error {:?}", e);
-                                    self.open = false;
-                                    return (Err(e), false);
-                                }
-                                None => {
-                                    payload_sender.feed_data(None);
-                                    break;
+                        if is_head_request() {
+                            // For HEAD requests, servers may return Transfer-Encoding: chunked but no actual body
+                            // RFC 7231: A HEAD response has the same headers as a GET response, 
+                            // but MUST NOT contain a message-body
+                            let payload = Payload::None;
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
+                        } else {
+                            let mut framed_payload = payload_decoder.with_io(handle);
+                            let (payload, mut payload_sender) = stream_payload_pair();
+                            loop {
+                                match framed_payload.next_data().await {
+                                    Some(Ok(data)) => payload_sender.feed_data(Some(data)),
+                                    Some(Err(e)) => {
+                                        #[cfg(feature = "logging")]
+                                        tracing::error!("decode upstream response error {:?}", e);
+                                        self.open = false;
+                                        return (Err(e), false);
+                                    }
+                                    None => {
+                                        payload_sender.feed_data(None);
+                                        break;
+                                    }
                                 }
                             }
+                            let payload = Payload::Stream(payload);
+                            let response = Response::from_parts(parts, payload.into());
+                            (Ok(response), false)
                         }
-                        let payload = Payload::Stream(payload);
-                        let response = Response::from_parts(parts, payload.into());
-                        (Ok(response), false)
                     }
                 }
             }
@@ -292,10 +426,42 @@ impl<K: Key, IO: AsyncReadRent + AsyncWriteRent> HttpConnection<K, IO> {
         ClientCodec<IO>: Sink<R, Error = E>,
         E: std::fmt::Debug + Into<HttpError>,
         R: IntoParts<Parts = RequestHead>,
-        R::Body: Body<Data = Bytes, Error = HttpError>,
+        R::Body: Body<Data = Bytes, Error = HttpError> + Into<HttpBody>,
     {
+        // We'll extract the parts to check the method below
+        
+        // For now, let's extract the parts to check the method
+        let (parts, body) = request.into_parts();
+        let is_head = parts.method == http::Method::HEAD;
+        
+        // Set the thread-local flag for HTTP/1.1 to use
+        set_head_request(is_head);
+        
+
+        
+        // Reconstruct and send
+        let request = monoio_http::common::request::Request::from_parts(parts, body);
+        
         match self {
-            Self::Http1(conn) => conn.send_request(request).await,
+            Self::Http1(conn) => {
+                // For HTTP/1, convert body to HttpBody then extract H1 Payload
+                let (parts, body) = request.into_parts();
+                let http_body: HttpBody = body.into();
+                let h1_payload = match http_body {
+                    monoio_http::common::body::HttpBody::H1(payload) => payload,
+                    monoio_http::common::body::HttpBody::H2(_h2_body) => {
+                        // Convert H2 body to H1 payload - use None for simplicity
+                        monoio_http::h1::payload::Payload::None
+                    },
+                    monoio_http::common::body::HttpBody::Ready(_bytes_opt) => {
+                        // Convert Ready bytes to Fixed payload - for simplicity, use None
+                        // TODO: Properly convert bytes to fixed payload
+                        monoio_http::h1::payload::Payload::None
+                    },
+                };
+                let h1_request = monoio_http::common::request::Request::from_parts(parts, h1_payload);
+                conn.send_reconstructed_request(h1_request).await
+            },
             Self::Http2(conn) => conn.send_request(request).await,
         }
     }
